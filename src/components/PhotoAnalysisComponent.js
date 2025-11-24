@@ -1,59 +1,110 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Alert, Image, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
-import { launchCamera, launchImageLibrary } from 'react-native-image-picker';
+import React, { useCallback, useEffect, useState } from 'react';
+import { Alert, Image, Modal, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { launchImageLibrary } from 'react-native-image-picker';
+import { uploadImage } from '../services/api';
+import { getUser } from '../utils/storage';
+import GuidedCameraView from './GuidedCameraView';
 
-const ANALYSIS_DELAY_MS = 2000;
-
-const mockAnalysisResult = {
-  score: 82,
-  issues: [
-    { type: 'warning', text: '치석이 약간 보입니다' },
-    { type: 'good', text: '잇몸 상태가 양호합니다' },
-    { type: 'info', text: '정기 검진을 권장합니다' },
-  ],
-  recommendations: [
-    '하루 2회 이상 양치질',
-    '치실 사용 권장',
-    '정기 스케일링 (6개월마다)',
-  ],
-};
+const IMAGE_TYPES = [
+  { id: 'upper', label: '윗니', emoji: '🦷', key: 'upper' },
+  { id: 'lower', label: '아랫니', emoji: '🦷', key: 'lower' },
+  { id: 'front', label: '앞니', emoji: '😁', key: 'front' },
+];
 
 export default function PhotoAnalysisComponent({ onReset }) {
-  const [selectedAsset, setSelectedAsset] = useState(null);
+  const [capturedImages, setCapturedImages] = useState({
+    upper: null,
+    lower: null,
+    front: null,
+  });
   const [analysisResult, setAnalysisResult] = useState(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [pickerError, setPickerError] = useState(null);
-  const timeoutRef = useRef(null);
-
-  const clearAnalysisTimeout = useCallback(() => {
-    if (timeoutRef.current) {
-      clearTimeout(timeoutRef.current);
-      timeoutRef.current = null;
-    }
-  }, []);
+  const [showImageTypes, setShowImageTypes] = useState(false);
+  const [activeCamera, setActiveCamera] = useState(null); // null | 'upper' | 'lower' | 'front'
 
   const resetState = useCallback(() => {
-    clearAnalysisTimeout();
-    setSelectedAsset(null);
+    setCapturedImages({
+      upper: null,
+      lower: null,
+      front: null,
+    });
     setAnalysisResult(null);
     setIsAnalyzing(false);
     setPickerError(null);
+    setShowImageTypes(false);
+    setActiveCamera(null);
     onReset?.();
-  }, [clearAnalysisTimeout, onReset]);
+  }, [onReset]);
 
-  const runMockAnalysis = useCallback(() => {
+  const allImagesCaputred = capturedImages.upper && capturedImages.lower && capturedImages.front;
+
+  const uploadAllImagesAndAnalyze = useCallback(async () => {
     setAnalysisResult(null);
     setIsAnalyzing(true);
+    setPickerError(null);
 
-    timeoutRef.current = setTimeout(() => {
-      setAnalysisResult(mockAnalysisResult);
+    try {
+      // 사용자 정보 가져오기
+      const user = await getUser();
+      
+      if (!user || !user.id) {
+        setPickerError('로그인이 필요합니다.');
+        setIsAnalyzing(false);
+        return;
+      }
+
+      // 세 개의 이미지를 모두 업로드
+      const uploadPromises = [
+        uploadImage(capturedImages.upper.uri, user.id, 'upper'),
+        uploadImage(capturedImages.lower.uri, user.id, 'lower'),
+        uploadImage(capturedImages.front.uri, user.id, 'front'),
+      ];
+
+      const responses = await Promise.all(uploadPromises);
+
+      // 모든 업로드가 성공했는지 확인
+      const allSuccess = responses.every(res => res.success);
+
+      if (allSuccess) {
+        // 마지막 응답의 AI 분석 결과 사용 (또는 통합 결과)
+        const lastResponse = responses[responses.length - 1];
+        const aiResult = lastResponse.data?.ai_result;
+        
+        if (aiResult) {
+          setAnalysisResult({
+            score: aiResult.overall_score || 0,
+            issues: aiResult.findings?.map(finding => ({
+              type: finding.severity === 'high' ? 'warning' : 
+                    finding.severity === 'medium' ? 'info' : 'good',
+              text: finding.description,
+            })) || [],
+            recommendations: aiResult.recommendations || [],
+          });
+        } else {
+          // AI 결과가 없는 경우 기본 메시지
+          setAnalysisResult({
+            score: 0,
+            issues: [
+              { type: 'info', text: 'AI 분석이 진행 중입니다. 잠시 후 다시 확인해주세요.' },
+            ],
+            recommendations: ['윗니, 아랫니, 앞니 사진이 모두 업로드되었습니다.'],
+          });
+        }
+      } else {
+        const failedUploads = responses.filter(res => !res.success);
+        setPickerError(`${failedUploads.length}개의 이미지 업로드에 실패했습니다.`);
+      }
+    } catch (error) {
+      console.error('이미지 업로드 오류:', error);
+      setPickerError(error.message || '이미지 업로드 중 오류가 발생했습니다.');
+    } finally {
       setIsAnalyzing(false);
-      timeoutRef.current = null;
-    }, ANALYSIS_DELAY_MS);
-  }, []);
+    }
+  }, [capturedImages]);
 
   const handlePickerResult = useCallback(
-    response => {
+    (response, imageType) => {
       if (!response || response.didCancel) {
         return;
       }
@@ -72,115 +123,203 @@ export default function PhotoAnalysisComponent({ onReset }) {
         return;
       }
 
-      clearAnalysisTimeout();
       setPickerError(null);
-      setSelectedAsset(asset);
-      runMockAnalysis();
+      setCapturedImages(prev => ({
+        ...prev,
+        [imageType]: asset,
+      }));
     },
-    [clearAnalysisTimeout, runMockAnalysis]
+    []
   );
 
   const handleLaunch = useCallback(
-    async type => {
-      const options = {
-        mediaType: 'photo',
-        quality: 0.8,
-        cameraType: 'back',
-        saveToPhotos: type === 'camera',
-      };
+    async (type, imageType) => {
+      if (type === 'camera') {
+        // 가이드 카메라 열기
+        setActiveCamera(imageType);
+      } else {
+        // 앨범에서 선택
+        const options = {
+          mediaType: 'photo',
+          quality: 0.8,
+        };
 
-      try {
-        const response =
-          type === 'camera'
-            ? await launchCamera(options)
-            : await launchImageLibrary(options);
-
-        handlePickerResult(response);
-      } catch (error) {
-        setPickerError('사진을 불러오는 중 오류가 발생했습니다. 다시 시도해주세요.');
+        try {
+          const response = await launchImageLibrary(options);
+          handlePickerResult(response, imageType);
+        } catch (error) {
+          setPickerError('사진을 불러오는 중 오류가 발생했습니다. 다시 시도해주세요.');
+        }
       }
     },
     [handlePickerResult]
   );
 
-  const handleUploadPress = useCallback(() => {
-    Alert.alert('사진 선택', '사진을 촬영하거나 앨범에서 선택해주세요.', [
-      { text: '앨범에서 선택', onPress: () => handleLaunch('library') },
-      { text: '카메라로 촬영', onPress: () => handleLaunch('camera') },
+  const handleCameraCapture = useCallback((photo, imageType) => {
+    setActiveCamera(null);
+    setCapturedImages(prev => ({
+      ...prev,
+      [imageType]: photo,
+    }));
+  }, []);
+
+  const handleCameraClose = useCallback(() => {
+    setActiveCamera(null);
+  }, []);
+
+  const handleImageTypePress = useCallback((imageType) => {
+    Alert.alert('사진 선택', '가이드 카메라로 촬영하거나 앨범에서 선택해주세요.', [
+      { text: '앨범에서 선택', onPress: () => handleLaunch('library', imageType) },
+      { text: '가이드 카메라 촬영', onPress: () => handleLaunch('camera', imageType) },
       { text: '취소', style: 'cancel' },
     ]);
   }, [handleLaunch]);
 
-  useEffect(() => () => resetState(), [resetState]);
+  const handleStartCapture = useCallback(() => {
+    setShowImageTypes(true);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      // 컴포넌트 언마운트 시 상태 초기화
+      resetState();
+    };
+  }, [resetState]);
 
   return (
     <View style={styles.container}>
       <View style={styles.card}>
-        {!selectedAsset ? (
+        {!analysisResult ? (
           <View style={styles.photoUploadSection}>
             <View style={styles.cameraIcon}>
               <Text style={styles.cameraIconText}>📷</Text>
             </View>
             <Text style={styles.photoTitle}>구강 사진을 촬영해주세요</Text>
             <Text style={styles.photoSubtext}>
-              AI가 사진을 분석하여 구강 건강 상태를 알려드립니다
+              윗니, 아랫니, 앞니를 모두 촬영하면 AI가 분석해드립니다
             </Text>
-            <TouchableOpacity onPress={handleUploadPress} style={styles.uploadButton}>
-              <Text style={styles.uploadButtonText}>📤 사진 촬영하기</Text>
-            </TouchableOpacity>
+
+            {!showImageTypes ? (
+              <TouchableOpacity onPress={handleStartCapture} style={styles.uploadButton}>
+                <Text style={styles.uploadButtonText}>📤 사진 촬영 시작</Text>
+              </TouchableOpacity>
+            ) : (
+              <View style={styles.imageTypesContainer}>
+                {IMAGE_TYPES.map((imageType) => {
+                  const isCaptured = capturedImages[imageType.key];
+                  return (
+                    <TouchableOpacity
+                      key={imageType.id}
+                      onPress={() => handleImageTypePress(imageType.key)}
+                      style={[
+                        styles.imageTypeButton,
+                        isCaptured && styles.imageTypeButtonCaptured,
+                      ]}
+                    >
+                      <Text style={styles.imageTypeEmoji}>{imageType.emoji}</Text>
+                      <Text style={styles.imageTypeLabel}>{imageType.label}</Text>
+                      {isCaptured && (
+                        <View style={styles.checkBadge}>
+                          <Text style={styles.checkIcon}>✓</Text>
+                        </View>
+                      )}
+                    </TouchableOpacity>
+                  );
+                })}
+
+                {allImagesCaputred && (
+                  <TouchableOpacity
+                    onPress={uploadAllImagesAndAnalyze}
+                    style={styles.analyzeButton}
+                    disabled={isAnalyzing}
+                  >
+                    <Text style={styles.analyzeButtonText}>
+                      {isAnalyzing ? '업로드 중...' : '🔍 분석 시작하기'}
+                    </Text>
+                  </TouchableOpacity>
+                )}
+
+                <TouchableOpacity onPress={resetState} style={styles.cancelButton}>
+                  <Text style={styles.cancelButtonText}>취소</Text>
+                </TouchableOpacity>
+              </View>
+            )}
+
             {pickerError ? <Text style={styles.errorText}>{pickerError}</Text> : null}
           </View>
         ) : (
           <View style={styles.analysisSection}>
-            <View style={styles.photoPreview}>
-              {selectedAsset?.uri ? (
-                <Image source={{ uri: selectedAsset.uri }} style={styles.photoPreviewImage} />
-              ) : (
-                <Text style={styles.photoPreviewText}>촬영된 사진</Text>
-              )}
+            <View style={styles.photoPreviewContainer}>
+              <Text style={styles.photoPreviewTitle}>촬영된 사진</Text>
+              <View style={styles.photoPreviewGrid}>
+                {IMAGE_TYPES.map((imageType) => (
+                  <View key={imageType.id} style={styles.photoPreviewItem}>
+                    <Image
+                      source={{ uri: capturedImages[imageType.key]?.uri }}
+                      style={styles.photoPreviewImage}
+                    />
+                    <Text style={styles.photoPreviewLabel}>{imageType.label}</Text>
+                  </View>
+                ))}
+              </View>
             </View>
+
             {isAnalyzing ? (
               <View style={styles.loadingSection}>
                 <Text style={styles.loadingText}>AI 분석 중...</Text>
               </View>
             ) : (
-              analysisResult && (
-                <View style={styles.resultSection}>
-                  <View style={styles.scoreSection}>
-                    <Text style={styles.scoreNumber}>{analysisResult.score}</Text>
-                    <Text style={styles.scoreLabel}>구강 건강 점수</Text>
-                  </View>
-
-                  <View style={styles.issuesSection}>
-                    {analysisResult.issues.map((issue, index) => (
-                      <View key={index} style={styles.issueItem}>
-                        <Text style={styles.issueIcon}>
-                          {issue.type === 'good' ? '✅' : issue.type === 'warning' ? '⚠️' : 'ℹ️'}
-                        </Text>
-                        <Text style={styles.issueText}>{issue.text}</Text>
-                      </View>
-                    ))}
-                  </View>
-
-                  <View style={styles.recommendationsSection}>
-                    <Text style={styles.recommendationsTitle}>추천 사항</Text>
-                    {analysisResult.recommendations.map((rec, index) => (
-                      <View key={index} style={styles.recommendationItem}>
-                        <Text style={styles.bullet}>•</Text>
-                        <Text style={styles.recommendationText}>{rec}</Text>
-                      </View>
-                    ))}
-                  </View>
-
-                  <TouchableOpacity onPress={resetState} style={styles.resetButton}>
-                    <Text style={styles.resetButtonText}>다시 분석하기</Text>
-                  </TouchableOpacity>
+              <View style={styles.resultSection}>
+                <View style={styles.scoreSection}>
+                  <Text style={styles.scoreNumber}>{analysisResult.score}</Text>
+                  <Text style={styles.scoreLabel}>구강 건강 점수</Text>
                 </View>
-              )
+
+                <View style={styles.issuesSection}>
+                  {analysisResult.issues.map((issue, index) => (
+                    <View key={index} style={styles.issueItem}>
+                      <Text style={styles.issueIcon}>
+                        {issue.type === 'good' ? '✅' : issue.type === 'warning' ? '⚠️' : 'ℹ️'}
+                      </Text>
+                      <Text style={styles.issueText}>{issue.text}</Text>
+                    </View>
+                  ))}
+                </View>
+
+                <View style={styles.recommendationsSection}>
+                  <Text style={styles.recommendationsTitle}>추천 사항</Text>
+                  {analysisResult.recommendations.map((rec, index) => (
+                    <View key={index} style={styles.recommendationItem}>
+                      <Text style={styles.bullet}>•</Text>
+                      <Text style={styles.recommendationText}>{rec}</Text>
+                    </View>
+                  ))}
+                </View>
+
+                <TouchableOpacity onPress={resetState} style={styles.resetButton}>
+                  <Text style={styles.resetButtonText}>다시 분석하기</Text>
+                </TouchableOpacity>
+              </View>
             )}
           </View>
         )}
       </View>
+
+      {/* 가이드 카메라 모달 */}
+      <Modal
+        visible={activeCamera !== null}
+        animationType="slide"
+        presentationStyle="fullScreen"
+        onRequestClose={handleCameraClose}
+      >
+        {activeCamera && (
+          <GuidedCameraView
+            imageType={activeCamera}
+            onCapture={(photo) => handleCameraCapture(photo, activeCamera)}
+            onClose={handleCameraClose}
+          />
+        )}
+      </Modal>
     </View>
   );
 }
@@ -234,6 +373,76 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '600',
   },
+  imageTypesContainer: {
+    width: '100%',
+    gap: 12,
+    marginTop: 12,
+  },
+  imageTypeButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#f3f4f6',
+    padding: 16,
+    borderRadius: 12,
+    borderWidth: 2,
+    borderColor: '#e5e7eb',
+    position: 'relative',
+  },
+  imageTypeButtonCaptured: {
+    backgroundColor: '#dbeafe',
+    borderColor: '#3b82f6',
+  },
+  imageTypeEmoji: {
+    fontSize: 32,
+    marginRight: 12,
+  },
+  imageTypeLabel: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#374151',
+    flex: 1,
+  },
+  checkBadge: {
+    position: 'absolute',
+    top: 8,
+    right: 8,
+    backgroundColor: '#10b981',
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  checkIcon: {
+    color: 'white',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  analyzeButton: {
+    backgroundColor: '#10b981',
+    paddingVertical: 14,
+    paddingHorizontal: 24,
+    borderRadius: 8,
+    marginTop: 8,
+  },
+  analyzeButtonText: {
+    color: 'white',
+    fontSize: 16,
+    fontWeight: '700',
+    textAlign: 'center',
+  },
+  cancelButton: {
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    marginTop: 4,
+  },
+  cancelButtonText: {
+    color: '#6b7280',
+    fontSize: 14,
+    fontWeight: '500',
+    textAlign: 'center',
+  },
   errorText: {
     marginTop: 12,
     color: '#ef4444',
@@ -241,20 +450,35 @@ const styles = StyleSheet.create({
   analysisSection: {
     gap: 16,
   },
-  photoPreview: {
-    height: 140,
-    backgroundColor: '#f3f4f6',
-    borderRadius: 12,
-    alignItems: 'center',
-    justifyContent: 'center',
-    overflow: 'hidden',
+  photoPreviewContainer: {
+    marginBottom: 8,
   },
-  photoPreviewText: {
-    color: '#6b7280',
+  photoPreviewTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#374151',
+    marginBottom: 12,
+  },
+  photoPreviewGrid: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  photoPreviewItem: {
+    flex: 1,
+    alignItems: 'center',
   },
   photoPreviewImage: {
     width: '100%',
-    height: '100%',
+    height: 80,
+    borderRadius: 8,
+    backgroundColor: '#f3f4f6',
+  },
+  photoPreviewLabel: {
+    fontSize: 12,
+    color: '#6b7280',
+    marginTop: 4,
+    textAlign: 'center',
   },
   loadingSection: {
     height: 120,
