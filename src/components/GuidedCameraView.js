@@ -9,6 +9,7 @@ import {
 } from 'react-native';
 import {
   Camera,
+  VisionCameraProxy,
   useCameraDevice,
   useCameraPermission,
   useFrameProcessor,
@@ -16,13 +17,28 @@ import {
 import Svg, { Circle, Polygon } from 'react-native-svg';
 import { runOnJS } from 'react-native-worklets-core';
 
-// Frame Processor 플러그인 타입 정의
-// eslint-disable-next-line no-undef
-const detectFace = typeof __detectFace !== 'undefined' ? __detectFace : null;
+/* global __detectFace */
+let detectFace = null;
+
+try {
+  if (VisionCameraProxy?.getInstance) {
+    const proxy = VisionCameraProxy.getInstance();
+    detectFace = proxy?.getFrameProcessorPlugin('detectFace');
+  } else if (VisionCameraProxy?.getFrameProcessorPlugin) {
+    detectFace = VisionCameraProxy.getFrameProcessorPlugin('detectFace');
+  }
+} catch (error) {
+  console.warn('VisionCameraProxy 초기화 실패:', error);
+}
+
+if (!detectFace && typeof __detectFace !== 'undefined') {
+  detectFace = __detectFace;
+}
+
+export const isMediaPipeReady = () => !!detectFace;
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
-// 각 치아 타입별 가이드라인 정의
 const GUIDES = {
   upper: {
     title: '윗니 촬영',
@@ -41,7 +57,16 @@ const GUIDES = {
   },
 };
 
-export default function GuidedCameraView({ imageType, onCapture, onClose }) {
+const DEFAULT_LIP_SERVER_URL = 'http://192.168.0.61:8000/detect-lips';
+
+export default function GuidedCameraView({
+  imageType,
+  onCapture,
+  onClose,
+  enableAutoCapture = true,
+  autoCaptureInterval = 1000,
+  lipServerUrl = DEFAULT_LIP_SERVER_URL,
+}) {
   const device = useCameraDevice('front');
   const camera = useRef(null);
   const { hasPermission, requestPermission } = useCameraPermission();
@@ -49,12 +74,48 @@ export default function GuidedCameraView({ imageType, onCapture, onClose }) {
   const [isReady, setIsReady] = useState(false);
   const [isCameraActive, setIsCameraActive] = useState(false);
   const [lipLandmarks, setLipLandmarks] = useState([]);
+  const lastLogTime = useRef(0);
+  const frameCountRef = useRef(0);
+  const lastFrameProcessorLog = useRef(0);
+  const autoCaptureTimerRef = useRef(null);
+  const autoCaptureInFlight = useRef(false);
 
   const guide = GUIDES[imageType] || GUIDES.front;
 
-  // 입술 랜드마크를 JS 스레드에서 업데이트하는 함수
+  useEffect(() => {
+    console.log('🚀 GuidedCameraView 마운트 - 이미지 타입:', imageType);
+    console.log('📱 카메라 디바이스:', device ? '✅ 사용 가능' : '❌ 없음');
+    if (device) {
+      console.log('카메라 정보 - ID:', device.id, '위치:', device.position);
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    console.log('🔌 detectFace 플러그인 상태:', detectFace ? '✅ 준비됨' : '❌ 없음');
+  }, []);
+
   const updateLipLandmarks = useCallback((points) => {
+    const now = Date.now();
+    if (now - lastLogTime.current > 1000) {
+      console.log('👄 입술 랜드마크 업데이트:', points.length, '개 포인트');
+      if (points.length > 0) {
+        console.log('첫 번째 포인트:', points[0]);
+      }
+      lastLogTime.current = now;
+    }
     setLipLandmarks(points);
+  }, []);
+
+  const logFrameProcessorEvent = useCallback((payload) => {
+    frameCountRef.current += 1;
+    const now = Date.now();
+    if (now - lastFrameProcessorLog.current > 1000) {
+      console.log(
+        `🎯 FrameProcessor #${frameCountRef.current}`,
+        JSON.stringify(payload),
+      );
+      lastFrameProcessorLog.current = now;
+    }
   }, []);
 
   const handleCameraReady = useCallback(() => {
@@ -62,82 +123,231 @@ export default function GuidedCameraView({ imageType, onCapture, onClose }) {
     console.log('✅ 카메라 준비 완료');
   }, []);
 
-  // 실시간 Frame Processor로 입술 감지
+  useEffect(() => {
+    if (!detectFace) {
+      console.warn('⚠️ detectFace 플러그인을 사용할 수 없습니다');
+      console.warn('MediaPipe Frame Processor가 제대로 빌드되었는지 확인하세요');
+    } else {
+      console.log('✅ detectFace 플러그인 로드 성공');
+    }
+  }, []);
+
   const frameProcessor = useFrameProcessor((frame) => {
     'worklet';
-    
+
     try {
       if (!detectFace) {
         return;
       }
-      
-      // Frame Processor 플러그인 호출
+
       const result = detectFace(frame);
-      
+
       if (result && result.lipPoints && result.lipPoints.length > 0) {
         const lipPoints = result.lipPoints;
-        
-        // 프레임 크기
+
         const fWidth = frame.width;
         const fHeight = frame.height;
-        
-        // 좌표 변환: 카메라 프레임 -> 화면 좌표
-        // 전면 카메라는 좌우 반전되므로 X 좌표를 미러링
+
         const scaleX = SCREEN_WIDTH / fWidth;
         const scaleY = SCREEN_HEIGHT / fHeight;
-        
+
+        // 🔧 좌우 반전 제거: 그냥 스케일만 적용
         const transformedPoints = lipPoints.map((point) => ({
-          x: SCREEN_WIDTH - (point.x * scaleX), // 좌우 반전
+          x: point.x * scaleX,
           y: point.y * scaleY,
         }));
-        
-        // JS 스레드로 전달
+
         runOnJS(updateLipLandmarks)(transformedPoints);
+        runOnJS(logFrameProcessorEvent)({
+          source: 'frameProcessor',
+          width: fWidth,
+          height: fHeight,
+          lipPointCount: lipPoints.length,
+          faceDetected: result.faceDetected,
+        });
       } else {
-        runOnJS(updateLipLandmarks)([]);
+        runOnJS(logFrameProcessorEvent)({
+          source: 'frameProcessor',
+          width: frame.width,
+          height: frame.height,
+          lipPointCount: 0,
+          faceDetected: result?.faceDetected ?? false,
+        });
       }
     } catch (e) {
-      console.log('Frame Processor 오류:', e);
+      console.log('❗ Frame Processor 오류:', e);
+      runOnJS(logFrameProcessorEvent)({
+        source: 'frameProcessor',
+        error: e?.message ?? 'unknown',
+      });
     }
-  }, [updateLipLandmarks]);
+  }, [logFrameProcessorEvent, updateLipLandmarks]);
 
-  // 권한 요청
   useEffect(() => {
+    console.log('📹 카메라 권한 상태:', hasPermission ? '✅ 허용됨' : '⚠️ 없음');
     if (!hasPermission) {
+      console.log('🔑 카메라 권한 요청 중...');
       requestPermission();
     }
   }, [hasPermission, requestPermission]);
 
-  // 카메라 활성/비활성 관리
   useEffect(() => {
-    setIsCameraActive(true);
-    return () => setIsCameraActive(false);
+    const timer = setTimeout(() => {
+      console.log('🎬 카메라 활성화');
+      setIsCameraActive(true);
+    }, 100);
+
+    return () => {
+      clearTimeout(timer);
+      console.log('🛑 카메라 비활성화');
+      setIsCameraActive(false);
+    };
   }, []);
 
-  // 촬영(수동만)
-  const takePhoto = useCallback(async () => {
-    if (!camera.current || !isReady) return;
+  const uploadLipPhoto = useCallback(
+    async (fileAsset) => {
+      if (!lipServerUrl) {
+        console.warn('⚠️ lipServerUrl 설정이 없어 업로드를 건너뜁니다');
+        return;
+      }
 
-    try {
-      const photo = await camera.current.takePhoto({
-        flash: 'off',
-        qualityPrioritization: 'quality',
-      });
+      try {
+        console.log('🌐 입술 서버 업로드 시작:', lipServerUrl);
+        const payload = new FormData();
+        payload.append('file', fileAsset);
 
-      // file:// URL 형식으로 변환
-      const uri = photo.path.startsWith('file://') 
-        ? photo.path 
-        : `file://${photo.path}`;
+        const response = await fetch(lipServerUrl, {
+          method: 'POST',
+          body: payload,
+        });
 
-      onCapture({
-        uri,
-        type: 'image/jpeg',
-        name: `dental_${imageType}_${Date.now()}.jpg`,
-      });
-    } catch (e) {
-      console.error('촬영 오류:', e);
+        const json = await response.json().catch(() => null);
+
+        if (!response.ok) {
+          throw new Error(json?.error || `HTTP ${response.status}`);
+        }
+
+        console.log('✅ 입술 서버 응답:', json);
+
+        if (json?.lipPoints?.length && json.width && json.height) {
+          const fWidth = json.width;
+          const fHeight = json.height;
+
+          const scaleX = SCREEN_WIDTH / fWidth;
+          const scaleY = SCREEN_HEIGHT / fHeight;
+
+          // 🔧 서버 응답도 좌우 반전 제거
+          const transformed = json.lipPoints.map((p) => ({
+            x: p.x * scaleX,
+            y: p.y * scaleY,
+          }));
+
+          console.log('🎨 서버 기반 입술 포인트 변환:', transformed.length);
+          setLipLandmarks(transformed);
+        } else {
+          console.log('ℹ️ 서버 응답에 유효한 lipPoints가 없습니다');
+        }
+      } catch (error) {
+        console.warn('⚠️ 입술 서버 업로드 실패:', error?.message ?? error);
+      }
+    },
+    [lipServerUrl],
+  );
+
+  const capturePhoto = useCallback(
+    async ({ notifyParent = false } = {}) => {
+      console.log(
+        '📸 촬영 시도 - 카메라 준비:',
+        isReady,
+        '카메라 ref:',
+        !!camera.current,
+      );
+
+      if (!camera.current || !isReady) {
+        console.warn('⚠️ 촬영 불가 - 카메라가 준비되지 않음');
+        return null;
+      }
+
+      try {
+        // 옵션 최소화: 가장 안정적인 기본 촬영
+        const photo = await camera.current.takePhoto({
+          enableShutterSound: false, // 📵 촬영 시 셔터음 비활성화 (지원 플랫폼 한정)
+        });
+
+        console.log('📸 촬영 성공, 결과:', photo);
+
+        const uri =
+          photo.path.startsWith('file://') ? photo.path : `file://${photo.path}`;
+        const asset = {
+          uri,
+          type: 'image/jpeg',
+          name: `dental_${imageType}_${Date.now()}.jpg`,
+        };
+
+        if (notifyParent && onCapture) {
+          console.log('📤 촬영 데이터 전달:', asset);
+          onCapture(asset);
+        }
+
+        await uploadLipPhoto(asset);
+        return asset;
+      } catch (error) {
+        console.error('❌ 촬영 오류:', error);
+        return null;
+      }
+    },
+    [imageType, isReady, onCapture, uploadLipPhoto],
+  );
+
+  const takePhoto = useCallback(() => {
+    capturePhoto({ notifyParent: true });
+  }, [capturePhoto]);
+
+  const triggerAutoCapture = useCallback(async () => {
+    if (autoCaptureInFlight.current) {
+      return;
     }
-  }, [isReady, imageType, onCapture]);
+
+    autoCaptureInFlight.current = true;
+    try {
+      await capturePhoto({ notifyParent: false });
+    } finally {
+      autoCaptureInFlight.current = false;
+    }
+  }, [capturePhoto]);
+
+  useEffect(() => {
+    const canAutoCapture =
+      enableAutoCapture && isReady && isCameraActive && hasPermission && !!lipServerUrl;
+
+    if (!canAutoCapture) {
+      if (autoCaptureTimerRef.current) {
+        clearInterval(autoCaptureTimerRef.current);
+        autoCaptureTimerRef.current = null;
+        console.log('⏹️ 자동 촬영 중지');
+      }
+      return undefined;
+    }
+
+    console.log('♻️ 자동 촬영 시작 - 주기(ms):', autoCaptureInterval);
+    autoCaptureTimerRef.current = setInterval(triggerAutoCapture, autoCaptureInterval);
+
+    return () => {
+      if (autoCaptureTimerRef.current) {
+        clearInterval(autoCaptureTimerRef.current);
+        autoCaptureTimerRef.current = null;
+        console.log('⏹️ 자동 촬영 종료');
+      }
+    };
+  }, [
+    autoCaptureInterval,
+    enableAutoCapture,
+    hasPermission,
+    isCameraActive,
+    isReady,
+    lipServerUrl,
+    triggerAutoCapture,
+  ]);
 
   if (!hasPermission) {
     return (
@@ -156,7 +366,7 @@ export default function GuidedCameraView({ imageType, onCapture, onClose }) {
   if (!device) {
     return (
       <View style={styles.loadingContainer}>
-        <ActivityIndicator size="large" color="#3b82f6" />
+        <ActivityIndicator size="large" />
         <Text style={styles.loadingText}>카메라를 불러오는 중...</Text>
       </View>
     );
@@ -164,22 +374,24 @@ export default function GuidedCameraView({ imageType, onCapture, onClose }) {
 
   return (
     <View style={styles.container}>
-      {/* 카메라 프리뷰 */}
       <Camera
         ref={camera}
         style={StyleSheet.absoluteFill}
         device={device}
         isActive={isCameraActive}
         photo={true}
+        pixelFormat="yuv"
         frameProcessor={frameProcessor}
         onInitialized={handleCameraReady}
-        onError={(error) => console.error('Camera error:', error)}
+        onError={(error) => {
+          console.error('Camera error:', error);
+          console.error('Error code:', error.code);
+          console.error('Error message:', error.message);
+        }}
       />
 
-      {/* 입술 랜드마크 SVG 오버레이 */}
       {lipLandmarks.length > 0 && (
         <Svg style={StyleSheet.absoluteFill} pointerEvents="none">
-          {/* 입술 영역을 반투명 폴리곤으로 채우기 */}
           {lipLandmarks.length > 3 && (
             <Polygon
               points={lipLandmarks.map((p) => `${p.x},${p.y}`).join(' ')}
@@ -189,7 +401,6 @@ export default function GuidedCameraView({ imageType, onCapture, onClose }) {
             />
           )}
 
-          {/* 입술 포인트들을 작은 점으로 표시 (디버깅용) */}
           {lipLandmarks.map((point, index) => (
             <Circle
               key={`lip-${index}`}
@@ -203,7 +414,6 @@ export default function GuidedCameraView({ imageType, onCapture, onClose }) {
         </Svg>
       )}
 
-      {/* 상단 안내 박스 */}
       <View style={styles.topContainer}>
         <View style={styles.guideBox}>
           <Text style={styles.guideEmoji}>{guide.emoji}</Text>
@@ -212,7 +422,6 @@ export default function GuidedCameraView({ imageType, onCapture, onClose }) {
         </View>
       </View>
 
-      {/* 디버그: 입술 포인트 개수만 간단히 표시 */}
       <View style={styles.debugContainer}>
         <Text style={styles.debugText}>카메라: {isReady ? '✅' : '⏳'}</Text>
         <Text style={styles.debugText}>
@@ -220,7 +429,6 @@ export default function GuidedCameraView({ imageType, onCapture, onClose }) {
         </Text>
       </View>
 
-      {/* 하단 컨트롤 */}
       <View style={styles.bottomContainer}>
         {isReady ? (
           <>
@@ -247,7 +455,6 @@ export default function GuidedCameraView({ imageType, onCapture, onClose }) {
         )}
       </View>
 
-      {/* 팁 안내 */}
       <View style={styles.tipsContainer}>
         <Text style={styles.tipsText}>💡 화면 중앙에 입을 맞춰주세요</Text>
         <Text style={styles.tipsText}>
